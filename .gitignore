@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ROS build artifacts
+build/
+devel/
+log/
+install/
+config/congfig.yaml
+
+# Model weights and config (don't commit local model files)
+*.pt
+*.pth
+*.onnx
+# *.yaml
+*.ckpt
+
+# Launch or config cache
+*.launch.user
+*.log
+
+# VSCode or JetBrains project settings
+.vscode/
+.idea/
+
+# Other common unwanted files
+*.swp
+.DS_Store

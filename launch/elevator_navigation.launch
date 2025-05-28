@@ -1,0 +1,39 @@
+<launch>
+    <!-- Load parameters -->
+    <rosparam command="load" file="$(find elevator_navigation)/config/params.yaml" />
+    <!-- 실제로는 각 노드에 필요한 파라미터를 params.yaml에 정의하고 여기서 로드 -->
+    <!-- 예: elevator_controller_sm 노드의 목표 좌표 파라미터 -->
+    <param name="/elevator_controller_smach/elevator_entrance_x" value="1.0" />
+    <param name="/elevator_controller_smach/elevator_entrance_y" value="2.0" />
+    <param name="/elevator_controller_smach/elevator_entrance_ow" value="1.0" />
+
+
+    <!-- Elevator Door Detector Node -->
+    <node pkg="elevator_navigation" type="elevator_door_detector.py" name="elevator_door_detector" output="screen">
+        <!-- 파라미터 설정 예시 -->
+        <param name="model_weights_path" value="$(find another_package)/models/yolo_elevator.pt" /> 
+        <!-- 실제 모델 가중치 파일 경로로 수정 필요 -->
+        <param name="confidence_threshold" value="0.6" />
+    </node>
+
+    <!-- Elevator Controller SM Node -->
+    <node pkg="elevator_navigation" type="elevator_controller_sm.py" name="elevator_controller_smach" output="screen">
+        <!-- 이 노드에서 사용할 파라미터는 위에서 param 태그로 설정하거나 params.yaml에서 로드 -->
+    </node>
+
+    <!-- Gazebo Elevator Controller Node (만약 ROS 노드 형태라면) -->
+    <!-- 
+    <node pkg="elevator_navigation" type="gazebo_elevator_controller_node.py" name="gazebo_elevator_controller_node" output="screen" />
+    -->
+    <!-- Gazebo 플러그인이라면 Gazebo 런치 파일 내에서 모델과 함께 로드됨 -->
+
+
+    <!-- (선택 사항) SMACH Viewer 실행 -->
+    <node pkg="smach_viewer" type="smach_viewer.py" name="smach_viewer" />
+
+    <!-- (선택 사항) Rviz 실행 및 설정 파일 로드 -->
+    <!-- 
+    <node type="rviz" name="rviz" pkg="rviz" args="-d $(find elevator_navigation)/config/elevator_nav.rviz" /> 
+    -->
+
+</launch>
