@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 # 엘리베이터 상태 관리 및 제어 노드
 # 엘리베이터 이용 전체 과정을 상태 머신으로 관리함!! 
 # move_base에 이동 목표 전송, 문 상태 인식 결과 수신, 엘리베이터 제어 인터페이스 호출 등
@@ -20,10 +22,10 @@ ELEVATOR_ENTRANCE_POSE = PoseStamped()
 
 ELEVATOR_INSIDE_POSE = PoseStamped()
 # ELEVATOR_INSIDE_POSE.header.frame_id = "map" # 또는 "elevator_link"
-# ...
 
 class MoveToState(smach.State):
     def __init__(self, target_pose, pose_name="target"):
+        # succeedded: 목표 도달 성공, aborted: 이동 실패(장애물, 경로 없음 등), preempted: 외부에서 중단됨
         smach.State.__init__(self, outcomes=['succeedded', 'aborted', 'preempted'])
         self.client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
         rospy.loginfo(f"Connectiong to move_base server for {pose_name}...")
@@ -34,7 +36,7 @@ class MoveToState(smach.State):
         self.outcome = None
 
     def execute(self, userdata):
-        rospy.loginfo(f'Executing state MOVE_TO_{self.pose_name.upper()}')
+        rospy.loginfo(f'🚀 Moving to {self.pose_name.upper()}')
         goal = MoveBaseGoal()
         goal.target_pose = self.target_pose
         goal.target_pose.header.stamp = rospy.Time.now() # 목표 전송 시 타임스탬프 설정
@@ -50,7 +52,6 @@ class MoveToState(smach.State):
         return self.outcome
     
     def done_cb(self, status, result):
-        # actionlib.GoalStatus.SUCCEEDED == 3
         if status == 3: # SUCCEEDED
             rospy.loginfo(f"Goal reached for {self.pose_name}")
             self.outcome = 'succeeded'

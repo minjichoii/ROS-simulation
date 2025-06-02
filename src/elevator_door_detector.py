@@ -134,7 +134,7 @@ class ElevatorDoorDetector:
             status_name = self.names[door_status] if door_status < len(self.names) else f"class_{door_status}"
             rospy.loginfo(f"🚪 Elevator door: {status_name} (class={door_status})")
         else:
-            rospy.logwarn("⚠️ No elevator door detected")
+            print("⚠️ No elevator door detected")
     
     def extract_door_status(self, pred):
         """NMS 후 결과에서 클래스 추출 (0: close, 1: open)"""
