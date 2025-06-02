@@ -1,6 +1,8 @@
 # config/config.yaml
 
-model_path: "/home/ivis/yolov9/runs/train/yolov9-c32/weights/best.pt"
+sys_path: "/home/ivis/yolov9"
+model_path: "/home/ivis/yolov9/runs/train/yolov9-0530/weights/best.pt"
 cfg_path: "/home/ivis/yolov9/models/detect/yolov9-c.yaml"
+classes_yaml_path: "/home/ivis/yolov9/data/data.yaml"
 image_topic: "/camera/color/image_raw"
 status_topic: "/elevator/door_status"
