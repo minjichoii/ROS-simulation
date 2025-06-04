@@ -4,6 +4,7 @@
 #include <std_msgs/Bool.h>
 #include <std_srvs/Empty.h>
 #include <gazebo_msgs/ModelStates.h>
+#include <sensor_msgs/JointState.h>
 #include <geometry_msgs/Pose.h>
 #include <geometry_msgs/Twist.h>
 
@@ -24,6 +25,7 @@ private:
     
     // Subscribers
     ros::Subscriber model_states_sub_;
+    ros::Subscriber joint_states_sub_;
     
     // Service servers
     ros::ServiceServer call_elevator_service_;
@@ -39,6 +41,8 @@ private:
     double elevator_y_;             // 엘리베이터 Y 위치
     double inside_threshold_;       // 탑승 판단 거리
     double approach_threshold_;     // 접근 판단 거리
+
+    double door_threshold_; // 엘베 측에서의 문 열림 판단
     
     // State variables
     int current_floor_;             // 0=1층, 1=2층, -1=이동중
@@ -51,6 +55,7 @@ private:
     geometry_msgs::Pose elevator_pose_;
     geometry_msgs::Pose robot_pose_;
     geometry_msgs::Twist elevator_velocity_;
+    double door_joint_position_;
     
     // 자동화 상태머신
     enum ElevatorState {
@@ -87,11 +92,18 @@ private:
         private_nh_.param<double>("floor_height", floor_height_, 3.075);
         private_nh_.param<double>("elevator_x", elevator_x_, 0.0);
         private_nh_.param<double>("elevator_y", elevator_y_, 0.0);
-        private_nh_.param<double>("inside_threshold", inside_threshold_, 1.125);  // 엘리베이터 내부 크기의 절반
-        private_nh_.param<double>("approach_threshold", approach_threshold_, 2.0);
+
+        // 박스 중심에서 모든 방향으로 1.125m씩 -> 총 2.25m 박스
+        private_nh_.param<double>("inside_threshold", inside_threshold_, 1.125);
+        private_nh_.param<double>("approach_threshold", approach_threshold_, 2.5);
         
+        // 문이 절반 이상 열렸을 때 "open"으로 판단함
+        private_nh_.param<double>("door_threshold", door_threshold_, 0.5);
+
         ROS_INFO("Floor height: %.3f", floor_height_);
         ROS_INFO("Elevator position: (%.1f, %.1f)", elevator_x_, elevator_y_);
+        ROS_INFO("🚪 Door threshold: %.1f", door_threshold_);
+        ROS_INFO("📦 Inside threshold: %.3f m", inside_threshold_);
     }
     
     void initializePublishers()
@@ -145,6 +157,24 @@ private:
         updateElevatorStates();
         publishStates();
     }
+
+    // joint 상태 콜백 
+    void jointStatesCallback(const sensor_msgs::JointState::ConstPtr&msg)
+    {
+        // 문 joint 위치 찾기
+        for (size_t i=0; i < msg->name.size(); ++i)
+        {
+            if (msg->name[i] == "elevator::door_joint") // 실제 joint명!!
+            {
+                if (i < msg->position.size()) {
+                    door_joint_position_ = msg->position[i];
+                    // 실제 joint 위치 기반으로 문 상태 업데이트함
+                    door_state_ = calculateDoorState(door_joint_position_);
+                }
+                break;
+            }
+        }
+    }
     
     void updateElevatorStates()
     {
@@ -164,14 +194,14 @@ private:
     int calculateCurrentFloor(double z_position)
     {
         // 실제 층 높이 기반 계산
-        if (z_position < floor_height_ / 2) {
+        if (z_position < floor_height_ / 2) { // 0 ~ 1.5375m
             return 0;  // 1층
         }
-        else if (z_position > floor_height_ * 1.5) {
+        else if (z_position > floor_height_ * 1.5) { // 4.0975m 이상
             return 1;  // 2층
         }
         else {
-            return -1; // 이동 중
+            return -1; // 이동 중 // 이동중
         }
     }
     
@@ -190,11 +220,25 @@ private:
         // 1층에서만 접근 감지
         if (current_floor_ != 0) return false;
         
+        // 실시간 X, Y
         double dx = robot_pose_.position.x - elevator_pose_.position.x;
         double dy = robot_pose_.position.y - elevator_pose_.position.y;
         double distance = sqrt(dx*dx + dy*dy);
         
         return (distance < approach_threshold_ && !robot_inside_);
+    }
+
+    std::string calculateDoorState(double door_joint_position)
+    {
+        if (door_joint_position > door_threshold_) {
+            return "OPENED"; // 0.5 시앙이면 열림
+        }
+        else if (door_joint_position < 0.1) {
+            return "CLOSED"; // 0.1 미만일 때 완전히 닫힘으로 판단
+        }
+        else {
+            return "MOVING";
+        }
     }
     
     void controlLoop(const ros::TimerEvent& event)
@@ -281,8 +325,8 @@ private:
     
     void startBoardingTimer()
     {
-        // 5초 탑승 타임아웃
-        door_timer_ = nh_.createTimer(ros::Duration(5.0), 
+        // 플러그인과 동일하게 10초 탑승 타임아웃
+        door_timer_ = nh_.createTimer(ros::Duration(10.0), 
                                     &GazeboElevatorController::boardingTimeoutCallback, this, true);
     }
     
