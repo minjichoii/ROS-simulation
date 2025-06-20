@@ -1,39 +1,184 @@
+<?xml version="1.0"?>
 <launch>
-    <!-- Load parameters -->
-    <rosparam command="load" file="$(find elevator_navigation)/config/params.yaml" />
-    <!-- 실제로는 각 노드에 필요한 파라미터를 params.yaml에 정의하고 여기서 로드 -->
-    <!-- 예: elevator_controller_sm 노드의 목표 좌표 파라미터 -->
-    <param name="/elevator_controller_smach/elevator_entrance_x" value="1.0" />
-    <param name="/elevator_controller_smach/elevator_entrance_y" value="2.0" />
-    <param name="/elevator_controller_smach/elevator_entrance_ow" value="1.0" />
+    <!-- first verion of elevator navigation package launch file-->
+    <!-- 현재 사용법: RViz 2D Nav goal로 엘리베이터 앞 클릭 -> 자동 운행 -> 2층에서 최종 목적지 재클릭 -->
+    <!-- 맵 파일은 1층 2층 따로 슬램한다는 전제하에 진행중! -->
 
+    <!-- ==== LAUNCH ARGUMENTS ==== -->
+    <!-- 추후에 실제 맵 파일로 변경!! 현재는 가정 ++ 로봇도 수정 필요함 -->
 
-    <!-- Elevator Door Detector Node -->
-    <node pkg="elevator_navigation" type="elevator_door_detector.py" name="elevator_door_detector" output="screen">
-        <!-- 파라미터 설정 예시 -->
-        <param name="model_weights_path" value="$(find another_package)/models/yolo_elevator.pt" /> 
-        <!-- 실제 모델 가중치 파일 경로로 수정 필요 -->
-        <param name="confidence_threshold" value="0.6" />
+    <!-- Launch Arguments -->
+    <!-- Robot spawn pose -->
+    <arg name="x" default="0"/>
+    <arg name="y" default="-3"/>
+    <arg name="z" default="0"/>
+    <arg name="roll" default="0"/>
+    <arg name="pitch" default="0"/>
+    <arg name="yaw" default="0"/>
+
+    <!-- System options -->
+    <arg name="use_rviz" default="true"/>
+    <arg name="debug" default="false"/>
+    <arg name="camera_topic" default="/camera/rgb/image_raw"/>
+    
+    <!-- Map files for 2 floors: 1st, 2nd -->
+    <arg name="map_1f" default="$(find elevator_navigation)/maps/elevator_1f_map.yaml"/>
+    <arg name="map_2f" default="$(find elevator_navigation)/maps/elevator_2f_map.yaml"/>
+    <arg name="use_maps" default="true" />
+
+    <!-- ===== GAZEBO WORLD SETUP ===== -->
+
+    <!-- Robot Description -->
+    <include file="$(find trixy)/launch/robot_description2.launch" />
+
+    <!-- Launch Gazebo World -->
+    <include file="$(find gazebo_ros)/launch/empty_world.launch">
+        <arg name="use_sim_time" value="true"/>
+        <arg name="debug" value="false"/>
+        <arg name="gui" value="true"/>
+        <arg name="world_name" value="$(arg world_file)"/>
+    </include>
+
+    <!-- ===== ROBOT SPAWNING ===== -->
+
+    <!-- Trixy Robot Description -->
+    <param name="robot_description" command="$(find xacro)/xacro --inorder '$(find trixy)/urdf/trixy2.xacro'" />
+
+    <!-- Spawn Trixy Robot -->
+    <node name="urdf_spawner" pkg="gazebo_ros" type="spawn_model" respawn="false" output="screen"
+          args="urdf -param robot_description -model trixy 
+              -x $(arg x) -y $(arg y) -z $(arg z)
+              -R $(arg roll) -P $(arg pitch) -Y $(arg yaw)"/>
+
+    <!-- Multi-Lidar Merger (from your original) -->
+    <node pkg="ira_laser_tools" name="laserscan_multi_merger" type="laserscan_multi_merger" output="screen">
+        <param name="destination_frame" value="base_link"/>
+        <param name="cloud_destination_topic" value="/merged_cloud"/>
+        <param name="scan_destination_topic" value="/scan"/>
+        <param name="laserscan_topics" value="/scan_front_lidar /scan_back_lidar"/>
+        <param name="angle_min" value="-3.141592"/>
+        <param name="angle_max" value="3.141592"/>
+        <param name="angle_increment" value="0.0017"/>
+        <param name="scan_time" value="0.0333333"/>
+        <param name="range_min" value="0.3"/>
+        <param name="range_max" value="50.0"/>
     </node>
 
-    <!-- Elevator Controller SM Node -->
-    <node pkg="elevator_navigation" type="elevator_controller_sm.py" name="elevator_controller_smach" output="screen">
-        <!-- 이 노드에서 사용할 파라미터는 위에서 param 태그로 설정하거나 params.yaml에서 로드 -->
+    <!-- ===== Navigation setup (2-Floor system)-->
+    <group if="$(arg use_maps)">
+        <!-- Multi-Floor Map Manager -->
+        <node pkg="elevator_navigation" type="multi_floor_map_manager.py"
+              name="multi_floor_map_manager" output="screen">
+          <param name="map_1f" value="$(arg map_1f)"/>
+            <param name="map_2f" value="$(arg map_2f)"/>
+            <param name="default_floor" value="1"/>
+        </node>
+
+        <!-- AMCL Localization -->
+        <include file="$(find turtlebot3_navigation)/launch/amcl.launch">
+            <arg name="model" value="waffle"/>
+            <arg name="initial_pose_x" value="$(arg x)"/>
+            <arg name="initial_pose_y" value="$(arg y)"/>
+            <arg name="initial_pose_a" value="$(arg yaw)"/>
+        </include>
+
+        <!-- Move Base Navigation -->
+        <include file="$(find turtlebot3_navigation)/launch/move_base.launch">
+            <arg name="model" value="waffle" />
+        </include>
+    </group>
+
+    <!-- ===== ELEVATOR SYSTEM PARAMETERS ===== -->
+  
+    <!-- 🏢 엘리베이터 물리 파라미터 -->
+    <param name="floor_height" value="3.075"/>
+    <param name="door_animation_duration" value="3.0"/>
+    <param name="lift_animation_duration" value="5.0"/>
+    
+    <!-- 🤖 로봇 감지 파라미터 (trixy 로봇에 맞게 조정) -->
+    <param name="detection_radius" value="1.2"/>
+    <param name="approach_radius" value="3.0"/>
+    <param name="inside_threshold" value="1.2"/>
+    <param name="approach_threshold" value="3.0"/>
+    
+    <!-- ⏰ 시스템 타이밍 파라미터 -->
+    <param name="action_timeout" value="30.0"/>
+    <param name="boarding_timeout" value="15.0"/>
+    
+    <!-- 🎮 모델명 파라미터 -->
+    <param name="elevator_model_name" value="elevator"/>
+    <param name="robot_model_name" value="trixy"/>
+    <param name="use_joint_control" value="true"/>
+
+    <!-- ===== ELEVATOR SYSTEM NODES ===== -->
+  
+    <!-- 1️⃣ YOLO Door Detector -->
+    <node pkg="elevator_navigation" type="elevator_door_detector_debug.py" 
+            name="elevator_door_detector" output="screen" respawn="true">
+        <param name="confidence_threshold" value="0.6"/>
+        <remap from="/camera/image_raw" to="$(arg camera_topic)"/>
+    </node>
+    
+    <!-- 2️⃣ Gazebo Elevator Actuator -->
+    <node pkg="elevator_navigation" type="elevator_gazebo_actuator" 
+            name="elevator_gazebo_actuator" output="screen" respawn="true">
+    </node>
+    
+    <!-- 3️⃣ Gazebo Elevator Controller -->
+    <node pkg="elevator_navigation" type="gazebo_elevator_controller" 
+            name="gazebo_elevator_controller" output="screen" respawn="true">
+    </node>
+    
+    <!-- 4️⃣ Robot Elevator Controller -->
+    <node pkg="elevator_navigation" type="robot_elevator_controller" 
+            name="robot_elevator_controller" output="screen" respawn="true">
+    </node>
+    
+    <!-- 5️⃣ Multi-Floor Navigation Manager -->
+    <node pkg="elevator_navigation" type="multi_floor_nav_manager.py" 
+            name="multi_floor_nav_manager" output="screen">
+        <param name="elevator_1f_x" value="0.0"/>
+        <param name="elevator_1f_y" value="-1.5"/>
+        <param name="elevator_2f_x" value="0.0"/>
+        <param name="elevator_2f_y" value="-1.5"/>
     </node>
 
-    <!-- Gazebo Elevator Controller Node (만약 ROS 노드 형태라면) -->
-    <!-- 
-    <node pkg="elevator_navigation" type="gazebo_elevator_controller_node.py" name="gazebo_elevator_controller_node" output="screen" />
-    -->
-    <!-- Gazebo 플러그인이라면 Gazebo 런치 파일 내에서 모델과 함께 로드됨 -->
+    <!-- ===== VISUALIZATION ===== -->
+  
+    <!-- RViz with Multi-Floor Navigation -->
+    <node type="rviz" name="elevator_trixy_rviz" pkg="rviz" 
+            args="-d $(find elevator_navigation)/rviz/elevator_trixy.rviz"
+            if="$(arg use_rviz)"/>
 
+    <!-- ===== MONITORING & DEBUGGING ===== -->
+    
+    <!-- System Status Monitor -->
+    <node pkg="elevator_navigation" type="system_status_monitor.py" 
+            name="system_status_monitor" output="screen"/>
+    
+    <!-- Usage Info for Trixy System -->
+    <node pkg="elevator_navigation" type="trixy_elevator_usage_info.py" 
+            name="usage_info" output="screen"/>
 
-    <!-- (선택 사항) SMACH Viewer 실행 -->
-    <node pkg="smach_viewer" type="smach_viewer.py" name="smach_viewer" />
+    <!-- ===== DEBUGGING TOOLS ===== -->
+    <group if="$(arg debug)">
+        <!-- Key topic monitoring -->
+        <node pkg="rostopic" type="rostopic" name="echo_door_status" 
+            args="echo /elevator_vision/door_status" output="screen"/>
+        <node pkg="rostopic" type="rostopic" name="echo_robot_inside" 
+            args="echo /elevator/robot_inside" output="screen"/>
+        <node pkg="rostopic" type="rostopic" name="echo_current_floor" 
+            args="echo /elevator/current_floor" output="screen"/>
+        <node pkg="rostopic" type="rostopic" name="echo_scan_merged" 
+            args="echo /scan" output="screen"/>
+        
+        <!-- RQT Graph -->
+        <node pkg="rqt_graph" type="rqt_graph" name="rqt_graph"/>
+    </group>
 
-    <!-- (선택 사항) Rviz 실행 및 설정 파일 로드 -->
-    <!-- 
-    <node type="rviz" name="rviz" pkg="rviz" args="-d $(find elevator_navigation)/config/elevator_nav.rviz" /> 
-    -->
+    <!-- ===== SYSTEM HEALTH CHECK ===== -->
+    <node pkg="elevator_navigation" type="trixy_system_checker.py" 
+            name="system_checker" output="screen"/>
+
 
 </launch>

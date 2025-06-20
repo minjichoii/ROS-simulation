@@ -2,419 +2,486 @@
 #include <std_msgs/Int32.h>
 #include <std_msgs/String.h>
 #include <std_msgs/Bool.h>
-#include <std_srvs/Empty.h>
-#include <gazebo_msgs/ModelStates.h>
-#include <sensor_msgs/JointState.h>
-#include <geometry_msgs/Pose.h>
 #include <geometry_msgs/Twist.h>
+#include <sensor_msgs/JointState.h>
+#include <gazebo_msgs/ModelStates.h>
+#include <cmath>                                              
 
-class GazeboElevatorController
-{
-private:
-    ros::NodeHandle nh_;
-    ros::NodeHandle private_nh_;
-    
-    // Publishers - 상태 정보 발행
-    ros::Publisher current_floor_pub_;
-    ros::Publisher door_state_pub_;
-    ros::Publisher is_moving_pub_;
-    ros::Publisher robot_inside_pub_;
-    
-    // Publisher - Gazebo 엘리베이터 제어 (핵심!)
-    ros::Publisher elevator_cmd_pub_;
-    
-    // Subscribers
-    ros::Subscriber model_states_sub_;
-    ros::Subscriber joint_states_sub_;
-    
-    // Service servers
-    ros::ServiceServer call_elevator_service_;
-    ros::ServiceServer goto_floor_service_;
-    
-    // Timer
-    ros::Timer control_timer_;
-    ros::Timer door_timer_;
-    
-    // 실제 환경 기반 파라미터
-    double floor_height_;           // 3.075 (실제 측정값)
-    double elevator_x_;             // 엘리베이터 X 위치
-    double elevator_y_;             // 엘리베이터 Y 위치
-    double inside_threshold_;       // 탑승 판단 거리
-    double approach_threshold_;     // 접근 판단 거리
+class GazeboElevatorController {
+    public:
+        // 자동화 상태
+        enum State {
+            IDLE_AT_1F,                 // 1층 대기 (문닫힌 상태)
+            DOOR_OPENING_1F,            // 1층에서 문 여는 중
+            WAITING_FOR_BOARDING,       // 로봇 탑승 대기 (문열린 상태)
+            DOOR_CLOSING_1F,            // 1층에서 문 닫는 중 (로봇 탑승 후)
+            MOVING_TO_2F,               // 2층으로 이동중
+            DOOR_OPENING_2F,            // 2층에서 문 여는 중
+            WAITING_FOR_EXIT,           // 로봇 하차 대기 (문열린 상태)
+            DOOR_CLOSING_2F,            // 2층에서 문 닫는 중 (로봇 하차 후)
+            RETURNING_TO_1F,             // 1층으로 복귀중
+            ERROR_STATE                 // 에러 상태
+        };
 
-    double door_threshold_; // 엘베 측에서의 문 열림 판단
-    
-    // State variables
-    int current_floor_;             // 0=1층, 1=2층, -1=이동중
-    std::string door_state_;        // "OPENED", "CLOSED", "OPENING", "CLOSING"
-    bool is_moving_;
-    bool robot_inside_;
-    bool robot_near_elevator_;
-    
-    // 위치 정보
-    geometry_msgs::Pose elevator_pose_;
-    geometry_msgs::Pose robot_pose_;
-    geometry_msgs::Twist elevator_velocity_;
-    double door_joint_position_;
-    
-    // 자동화 상태머신
-    enum ElevatorState {
-        IDLE,                       // 대기 상태
-        WAITING_FOR_ROBOT,          // 로봇 접근 대기  
-        DOOR_OPENING,               // 문 여는 중
-        WAITING_FOR_BOARDING,       // 탑승 대기
-        DOOR_CLOSING,               // 문 닫는 중
-        MOVING_TO_FLOOR,            // 층간 이동
-        ARRIVED_AT_DESTINATION      // 도착 완료
-    };
-    ElevatorState elevator_state_;
+        GazeboElevatorController() : current_state_(IDLE_AT_1F) {
+            initializePublishers();
+            initializeSubscribers();
+            initializeParameters();
 
-public:
-    GazeboElevatorController() : private_nh_("~"), current_floor_(0), is_moving_(false), 
-                                robot_inside_(false), robot_near_elevator_(false),
-                                door_state_("CLOSED"), elevator_state_(IDLE)
-    {
-        initializeParameters();
-        initializePublishers();
-        initializeSubscribers();
-        initializeServices();
+            // 상태 업데이트 타이머
+            state_timer_ = nh_.createTimer(ros::Duration(0.1), &GazeboElevatorController::stateUpdateCallback, this);
+
+            // 통계 타이머
+            statistics_timer_ = nh_.createTimer(ros::Duration(10.0), &GazeboElevatorController::printStatisticsCallback, this);
         
-        // 제어 루프 타이머 (10Hz)
-        control_timer_ = nh_.createTimer(ros::Duration(0.1), &GazeboElevatorController::controlLoop, this);
-        
-        ROS_INFO("Gazebo Elevator Controller initialized for actual world");
-    }
-    
-private:
-    void initializeParameters()
-    {
-        // 실제 월드 파일 기반 파라미터
-        private_nh_.param<double>("floor_height", floor_height_, 3.075);
-        private_nh_.param<double>("elevator_x", elevator_x_, 0.0);
-        private_nh_.param<double>("elevator_y", elevator_y_, 0.0);
+            // 통계 변수 초기화
+            mission_count_ = 0;
+            total_wait_time_ = 0.0;
+            mission_start_time_ = ros::Time::now();
 
-        // 박스 중심에서 모든 방향으로 1.125m씩 -> 총 2.25m 박스
-        private_nh_.param<double>("inside_threshold", inside_threshold_, 1.125);
-        private_nh_.param<double>("approach_threshold", approach_threshold_, 2.5);
-        
-        // 문이 절반 이상 열렸을 때 "open"으로 판단함
-        private_nh_.param<double>("door_threshold", door_threshold_, 0.5);
-
-        ROS_INFO("Floor height: %.3f", floor_height_);
-        ROS_INFO("Elevator position: (%.1f, %.1f)", elevator_x_, elevator_y_);
-        ROS_INFO("🚪 Door threshold: %.1f", door_threshold_);
-        ROS_INFO("📦 Inside threshold: %.3f m", inside_threshold_);
-    }
-    
-    void initializePublishers()
-    {
-        // 상태 정보 발행
-        current_floor_pub_ = nh_.advertise<std_msgs::Int32>("/elevator_sim/current_floor", 1);
-        door_state_pub_ = nh_.advertise<std_msgs::String>("/elevator_sim/door_state", 1);
-        is_moving_pub_ = nh_.advertise<std_msgs::Bool>("/elevator_sim/is_moving", 1);
-        robot_inside_pub_ = nh_.advertise<std_msgs::Bool>("/elevator_sim/robot_inside", 1);
-        
-        // 💥 핵심! Gazebo 플러그인 제어용
-        elevator_cmd_pub_ = nh_.advertise<std_msgs::Int32>("/gazebo/default/elevator", 1);
-    }
-    
-    void initializeSubscribers()
-    {
-        model_states_sub_ = nh_.subscribe("/gazebo/model_states", 1, 
-                                        &GazeboElevatorController::modelStatesCallback, this);
-    }
-    
-    void initializeServices()
-    {
-        call_elevator_service_ = nh_.advertiseService("/elevator_control/call_elevator", 
-                                                    &GazeboElevatorController::callElevatorService, this);
-        goto_floor_service_ = nh_.advertiseService("/elevator_control/goto_floor", 
-                                                 &GazeboElevatorController::gotoFloorService, this);
-    }
-    
-    void modelStatesCallback(const gazebo_msgs::ModelStates::ConstPtr& msg)
-    {
-        // 엘리베이터와 로봇 모델 찾기
-        for (size_t i = 0; i < msg->name.size(); ++i)
-        {
-            // 💥 실제 모델명에 맞춰 수정 필요
-            if (msg->name[i] == "elevator" || msg->name[i].find("elevator") != std::string::npos)
-            {
-                elevator_pose_ = msg->pose[i];
-                if (i < msg->twist.size()) {
-                    elevator_velocity_ = msg->twist[i];
-                }
-            }
-            // 로봇 모델명 (실제 환경에 맞춰 수정)
-            else if (msg->name[i].find("turtlebot3") != std::string::npos || 
-                     msg->name[i].find("robot") != std::string::npos ||
-                     msg->name[i].find("trixy") != std::string::npos)
-            {
-                robot_pose_ = msg->pose[i];
-            }
+            ROS_INFO("🚀 Gazebo Elevator Controller initialized!");
+            ROS_INFO("🏢 Current state: %s", stateToString(current_state_).c_str());
         }
-        
-        updateElevatorStates();
-        publishStates();
-    }
 
-    // joint 상태 콜백 
-    void jointStatesCallback(const sensor_msgs::JointState::ConstPtr&msg)
-    {
-        // 문 joint 위치 찾기
-        for (size_t i=0; i < msg->name.size(); ++i)
-        {
-            if (msg->name[i] == "elevator::door_joint") // 실제 joint명!!
-            {
-                if (i < msg->position.size()) {
-                    door_joint_position_ = msg->position[i];
-                    // 실제 joint 위치 기반으로 문 상태 업데이트함
-                    door_state_ = calculateDoorState(door_joint_position_);
-                }
-                break;
+    private:
+        ros::NodeHandle nh_;
+        
+        // 🎯 Publishers - 액추에이터에게 명령 전송
+        ros::Publisher door_control_pub_;      // /elevator/door_control
+        ros::Publisher elevator_control_pub_;  // /elevator/move_command
+        
+        // 🎯 Subscribers - 실제 피드백 받기
+        ros::Subscriber robot_inside_sub_;     // /elevator/robot_inside
+        ros::Subscriber current_floor_sub_;    // /elevator/current_floor
+        ros::Subscriber door_status_sub_;      // /elevator/door_status
+        ros::Subscriber elevator_status_sub_;  // /elevator/status
+        ros::Subscriber robot_approach_sub_;   // /elevator/robot_approach
+
+        ros::Subscriber door_vision_sub_; // /elevator_vision/door_status (YOLO)
+        ros::Subscriber model_states_sub_; // /gazebo/model_states (백업용정의)
+        
+        // 🎯 Timers
+        ros::Timer state_timer_;               // 상태 업데이트
+        ros::Timer action_timer_;              // 액션 타임아웃
+        ros::Timer statistics_timer_;          // 통계 출력
+        
+        // 🎯 상태 변수들 (실제 피드백 기반)
+        State current_state_;
+        bool robot_inside_;                    // 실제 로봇 탑승 상태
+        bool robot_approaching_;               // 로봇 접근 상태
+        int current_floor_;                    // 실제 현재 층 (0=1층, 1=2층)
+        std::string door_status_;              // 실제 문 상태 ("open", "close", "moving")
+        std::string elevator_status_;          // 실제 엘리베이터 상태 ("moving", "stopped")
+        
+        // 🎯 백업 상태 변수
+        std::string door_state_; // YOLO 문 상태
+        bool robot_near_;
+        bool is_moving_;
+
+        // 🎯 타이밍 및 통계
+        ros::Time state_change_time_;
+        ros::Time mission_start_time_;
+        double action_timeout_;
+        int mission_count_;
+        double total_wait_time_;
+
+        // 매개변수들
+        double inside_threshold_; // 탑승 감지 거리
+        double approach_threshold_; // 접근 감지 거리
+        double boarding_timeout_;  // 탑승 대기 시간
+        double floor_height_; // 층간 높이
+
+        void initializeParameters() {
+            nh_.param("action_timeout", action_timeout_, 30.0);
+            nh_.param("inside_threshold", inside_threshold_, 1.2);
+            nh_.param("approach_threshold", approach_threshold_, 3.0);
+            nh_.param("boarding_timeout", boarding_timeout_, 15.0);
+            nh_.param("floor_height", floor_height_, 3.075);
+
+            // 초기 상태 설정
+            robot_inside_ = false;
+            robot_approaching_ = false;
+            current_floor_ = 0;  // 1층에서 시작
+            door_status_ = "close";
+            elevator_status_ = "stopped";
+            
+            // 기존 호환 변수들
+            door_state_ = "close";
+            robot_near_ = false;
+            is_moving_ = false;
+            
+            state_change_time_ = ros::Time::now();
+            
+            ROS_INFO("📋 Parameters initialized:");
+            ROS_INFO("   Floor height: %.3fm", floor_height_);
+            ROS_INFO("   Inside threshold: %.1fm", inside_threshold_);
+            ROS_INFO("   Approach threshold: %.1fm", approach_threshold_);
+        }
+
+        void initializePublishers() {
+            door_control_pub_ = nh_.advertise<std_msgs::String>("/elevator/door_control", 1);
+            elevator_control_pub_ = nh_.advertise<std_msgs::Int32>("/elevator/move_command", 1);
+
+            ROS_INFO("📡 Publishers initialized");
+        }
+
+        void initializeSubscribers() {
+            // 새로운 피드백 시스템
+            robot_inside_sub_ = nh_.subscribe("/elevator/robot_inside", 1, 
+                                            &GazeboElevatorController::robotInsideCallback, this);
+            current_floor_sub_ = nh_.subscribe("/elevator/current_floor", 1, 
+                                            &GazeboElevatorController::currentFloorCallback, this);
+            door_status_sub_ = nh_.subscribe("/elevator/door_status", 1, 
+                                        &GazeboElevatorController::doorStatusCallback, this);
+            elevator_status_sub_ = nh_.subscribe("/elevator/status", 1, 
+                                            &GazeboElevatorController::elevatorStatusCallback, this);
+            robot_approach_sub_ = nh_.subscribe("/elevator/robot_approach", 1, 
+                                            &GazeboElevatorController::robotApproachCallback, this);
+            
+            // 기존 시스템과의 호환성
+            door_vision_sub_ = nh_.subscribe("/elevator_vision/door_status", 1, 
+                                        &GazeboElevatorController::doorVisionCallback, this);
+            model_states_sub_ = nh_.subscribe("/gazebo/model_states", 1, 
+                                            &GazeboElevatorController::modelStatesCallback, this);
+            
+            ROS_INFO("📡 Subscribers initialized");
+        }
+
+        void robotInsideCallback(const std_msgs::Bool::ConstPtr& msg) {
+            if (robot_inside_ != msg->data) {
+                robot_inside_ = msg->data;
+                ROS_INFO("🤖 Robot %s elevator", robot_inside_ ? "ENTERED" : "EXITED");
             }
         }
-    }
-    
-    void updateElevatorStates()
-    {
-        // 1. 현재 층 계산 (실제 높이 기반)
-        double z_pos = elevator_pose_.position.z;
-        current_floor_ = calculateCurrentFloor(z_pos);
-        
-        // 2. 이동 상태 판단
-        double velocity_threshold = 0.05;
-        is_moving_ = (fabs(elevator_velocity_.linear.z) > velocity_threshold);
-        
-        // 3. 로봇 위치 계산
-        robot_inside_ = calculateRobotInside();
-        robot_near_elevator_ = calculateRobotNearElevator();
-    }
-    
-    int calculateCurrentFloor(double z_position)
-    {
-        // 실제 층 높이 기반 계산
-        if (z_position < floor_height_ / 2) { // 0 ~ 1.5375m
-            return 0;  // 1층
-        }
-        else if (z_position > floor_height_ * 1.5) { // 4.0975m 이상
-            return 1;  // 2층
-        }
-        else {
-            return -1; // 이동 중 // 이동중
-        }
-    }
-    
-    bool calculateRobotInside()
-    {
-        double dx = robot_pose_.position.x - elevator_pose_.position.x;
-        double dy = robot_pose_.position.y - elevator_pose_.position.y;
-        double dz = robot_pose_.position.z - elevator_pose_.position.z;
-        
-        // 엘리베이터 내부 영역 체크 (2.25 x 2.25 크기)
-        return (fabs(dx) < inside_threshold_ && fabs(dy) < inside_threshold_ && fabs(dz) < 1.0);
-    }
-    
-    bool calculateRobotNearElevator()
-    {
-        // 1층에서만 접근 감지
-        if (current_floor_ != 0) return false;
-        
-        // 실시간 X, Y
-        double dx = robot_pose_.position.x - elevator_pose_.position.x;
-        double dy = robot_pose_.position.y - elevator_pose_.position.y;
-        double distance = sqrt(dx*dx + dy*dy);
-        
-        return (distance < approach_threshold_ && !robot_inside_);
-    }
 
-    std::string calculateDoorState(double door_joint_position)
-    {
-        if (door_joint_position > door_threshold_) {
-            return "OPENED"; // 0.5 시앙이면 열림
+        void currentFloorCallback(const std_msgs::Int32::ConstPtr& msg) {
+            if (current_floor_ != msg->data) {
+                current_floor_ = msg->data;
+                ROS_INFO("🏢 Floor: %d (%s)", current_floor_, 
+                   current_floor_ == 0 ? "1층" : "2층");
+            }
         }
-        else if (door_joint_position < 0.1) {
-            return "CLOSED"; // 0.1 미만일 때 완전히 닫힘으로 판단
+
+        void doorStatusCallback(const std_msgs::String::ConstPtr& msg) {
+            if (door_status_ != msg->data) {
+                door_status_ = msg->data;
+                door_state_ = msg->data;
+                ROS_INFO("🚪 Door status: %s", door_status_.c_str());
+            }
         }
-        else {
-            return "MOVING";
+
+        void elevatorStatusCallback(const std_msgs::String::ConstPtr& msg) {
+            if (elevator_status_ != msg->data) {
+                elevator_status_ = msg->data;
+                is_moving_ = (elevator_status_ == "moving");
+                ROS_INFO("🛗 Elevator status: %s", elevator_status_.c_str());
+            }
         }
-    }
-    
-    void controlLoop(const ros::TimerEvent& event)
-    {
-        // 🎯 자동화 상태머신 실행
-        switch (elevator_state_)
-        {
-            case IDLE:
-                if (robot_near_elevator_ && current_floor_ == 0) {
-                    ROS_INFO("🤖 Robot detected! Opening door...");
-                    openDoor();
-                    elevator_state_ = DOOR_OPENING;
-                }
-                break;
-                
-            case DOOR_OPENING:
-                if (door_state_ == "OPENED") {
-                    ROS_INFO("🚪 Door opened! Waiting for boarding...");
-                    elevator_state_ = WAITING_FOR_BOARDING;
-                    startBoardingTimer();
-                }
-                break;
-                
-            case WAITING_FOR_BOARDING:
-                if (robot_inside_) {
-                    ROS_INFO("🛗 Robot boarded! Closing door...");
-                    closeDoor();
-                    elevator_state_ = DOOR_CLOSING;
-                    stopBoardingTimer();
-                }
-                break;
-                
-            case DOOR_CLOSING:
-                if (door_state_ == "CLOSED") {
-                    ROS_INFO("⬆️ Moving to 2nd floor...");
-                    gotoFloor(1);  // 2층으로 이동
-                    elevator_state_ = MOVING_TO_FLOOR;
-                }
-                break;
-                
-            case MOVING_TO_FLOOR:
-                if (!is_moving_ && current_floor_ == 1) {
-                    ROS_INFO("🎯 Arrived at 2nd floor! Opening door...");
-                    openDoor();
-                    elevator_state_ = ARRIVED_AT_DESTINATION;
-                }
-                break;
-                
-            case ARRIVED_AT_DESTINATION:
-                if (!robot_inside_ && door_state_ == "OPENED") {
-                    ROS_INFO("👋 Robot exited! Returning to idle...");
-                    closeDoor();
-                    // 3초 후 IDLE로 복귀
-                    door_timer_ = nh_.createTimer(ros::Duration(3.0), 
-                                                &GazeboElevatorController::returnToIdleCallback, this, true);
-                }
-                break;
+
+        void robotApproachCallback(const std_msgs::Bool::ConstPtr& msg) {
+            if (robot_approaching_ != msg->data) {
+                robot_approaching_ = msg->data;
+                robot_near_ = msg->data; // 기존 변수랑 동기화
+                ROS_INFO("🤖 Robot %s elevator area", robot_approaching_ ? "APPROACHING" : "LEFT");
+            }
         }
-    }
-    
-    void openDoor()
-    {
-        door_state_ = "OPENING";
-        // 2초 후 문 열림 완료
-        door_timer_ = nh_.createTimer(ros::Duration(2.0), 
-                                    &GazeboElevatorController::doorOpenedCallback, this, true);
-    }
-    
-    void closeDoor()
-    {
-        door_state_ = "CLOSING";
-        // 2초 후 문 닫힘 완료
-        door_timer_ = nh_.createTimer(ros::Duration(2.0), 
-                                    &GazeboElevatorController::doorClosedCallback, this, true);
-    }
-    
-    void gotoFloor(int floor)
-    {
-        std_msgs::Int32 cmd;
-        cmd.data = floor;
-        elevator_cmd_pub_.publish(cmd);
-        ROS_INFO("💨 Elevator command sent: floor %d", floor);
-    }
-    
-    void startBoardingTimer()
-    {
-        // 플러그인과 동일하게 10초 탑승 타임아웃
-        door_timer_ = nh_.createTimer(ros::Duration(10.0), 
-                                    &GazeboElevatorController::boardingTimeoutCallback, this, true);
-    }
-    
-    void stopBoardingTimer()
-    {
-        door_timer_.stop();
-    }
-    
-    // 타이머 콜백들
-    void doorOpenedCallback(const ros::TimerEvent& event)
-    {
-        door_state_ = "OPENED";
-        ROS_INFO("✅ Door fully opened");
-    }
-    
-    void doorClosedCallback(const ros::TimerEvent& event)
-    {
-        door_state_ = "CLOSED";
-        ROS_INFO("✅ Door fully closed");
-    }
-    
-    void boardingTimeoutCallback(const ros::TimerEvent& event)
-    {
-        if (elevator_state_ == WAITING_FOR_BOARDING) {
-            ROS_WARN("⏰ Boarding timeout! Closing door...");
-            closeDoor();
-            elevator_state_ = DOOR_CLOSING;
+
+        void doorVisionCallback(const std_msgs::String::ConstPtr& msg) {
+            if (door_state_ != msg->data) {
+                door_state_ = msg->data;
+                door_status_ = msg->data;
+                ROS_INFO("🎥 YOLO Door: %s", door_state_.c_str());
+            }
         }
-    }
-    
-    void returnToIdleCallback(const ros::TimerEvent& event)
-    {
-        elevator_state_ = IDLE;
-        ROS_INFO("💤 Elevator returned to IDLE state");
-    }
-    
-    void publishStates()
-    {
-        // 현재 층
-        std_msgs::Int32 floor_msg;
-        floor_msg.data = current_floor_;
-        current_floor_pub_.publish(floor_msg);
-        
-        // 문 상태
-        std_msgs::String door_msg;
-        door_msg.data = door_state_;
-        door_state_pub_.publish(door_msg);
-        
-        // 이동 상태
-        std_msgs::Bool moving_msg;
-        moving_msg.data = is_moving_;
-        is_moving_pub_.publish(moving_msg);
-        
-        // 로봇 탑승 상태
-        std_msgs::Bool inside_msg;
-        inside_msg.data = robot_inside_;
-        robot_inside_pub_.publish(inside_msg);
-    }
-    
-    bool callElevatorService(std_srvs::Empty::Request& req, std_srvs::Empty::Response& res)
-    {
-        ROS_INFO("📞 Elevator called via service");
-        gotoFloor(0);  // 1층 호출
-        return true;
-    }
-    
-    bool gotoFloorService(std_srvs::Empty::Request& req, std_srvs::Empty::Response& res)
-    {
-        ROS_INFO("🎯 Go to floor service called");
-        gotoFloor(1);  // 2층 이동
-        return true;
-    }
+
+        void modelStatesCallback(const gazebo_msgs::ModelStates::ConstPtr& msg) {
+            // 백업 시스템 - 액추에이터가 없을 때 사용
+            static bool actuator_available = true;
+            static int no_feedback_count = 0;
+            
+            // 피드백이 오지 않으면 직접 계산
+            if (++no_feedback_count > 50) {  // 5초간 피드백 없음
+                actuator_available = false;
+                calculateStatesFromGazebo(msg);
+            }
+        }
+
+        void calculateStatesFromGazebo(const gazebo_msgs::ModelStates::ConstPtr& msg) {
+            geometry_msgs::Pose robot_pose, elevator_pose;
+            bool robot_found = false, elevator_found = false;
+
+            for (size_t i = 0; i < msg->name.size(); i++) {
+                if (msg->name[i].find("robot") != std::string::npos || 
+                msg->name[i].find("turtlebot") != std::string::npos) {
+                    robot_pose = msg->pose[i];
+                    robot_found = true;
+                }
+                else if (msg->name[i].find("elevator") != std::string::npos) {
+                    elevator_pose = msg->pose[i];
+                    elevator_found = true;
+                }
+            }
+
+            if (robot_found && elevator_found) {
+                double dx = robot_pose.position.x - elevator_pose.position.x;
+                double dy = robot_pose.position.y - elevator_pose.position.y;
+                double distance = sqrt(dx*dx + dy*dy);
+
+                // 층 계산
+                int new_floor = (elevator_pose.position.z < floor_height_ / 2) ? 0 : 1;
+                if (current_floor_ != new_floor) {
+                    current_floor_ = new_floor;
+                    ROS_INFO("🏢 Floor (backup): %d", current_floor_);
+                }
+
+                // 로봇 상태 계산
+                bool new_inside = (distance < inside_threshold_);
+                bool new_approaching = (distance < approach_threshold_ && !new_inside);
+
+                if (robot_inside_ != new_inside) {
+                    robot_inside_ = new_inside;
+                    ROS_INFO("🤖 Robot %s (backup)", robot_inside_ ? "ENTERED" : "EXITED");
+                }
+
+                if (robot_approaching_ != new_approaching) {
+                    robot_approaching_ = new_approaching;
+                    robot_near_ = new_approaching; // 기존 변수와 동기화함
+                    ROS_INFO("🤖 Robot %s (backup)", robot_approaching_ ? "APPROACHING" : "LEFT");
+                }
+            }
+        }
+
+        void stateUpdateCallback(const ros::TimerEvent&) {
+            switch (current_state_) {
+                case IDLE_AT_1F:
+                    handleIdleAt1F();
+                    break;
+                case DOOR_OPENING_1F:
+                    handleDoorOpening1F();
+                    break;
+                case WAITING_FOR_BOARDING:
+                    handleWaitingForBoarding();
+                    break;
+                case DOOR_CLOSING_1F:
+                    handleDoorClosing1F();
+                    break;
+                case MOVING_TO_2F:
+                    handleMovingTo2F();
+                    break;
+                case DOOR_OPENING_2F:
+                    handleDoorOpening2F();
+                    break;
+                case WAITING_FOR_EXIT:
+                    handleWaitingForExit();
+                    break;
+                case DOOR_CLOSING_2F:
+                    handleDoorClosing2F();
+                    break;
+                case RETURNING_TO_1F:
+                    handleReturningTo1F();
+                    break;
+                case ERROR_STATE:
+                    handleErrorState();
+                    break;
+            }
+        }
+
+        // 상태별 핸들러들
+        void handleIdleAt1F() {
+            // 1층에서 로봇 접근 감지 시 자동으로 문 "open"
+            if (robot_near_ && current_floor_ == 0 && door_state_ == "close") {
+                ROS_INFO("🤖 Robot approaching! Opening door...");
+                sendDoorCommand("open");
+                changeState(DOOR_OPENING_1F);
+                mission_start_time_ = ros::Time::now();
+            }
+        }
+
+        void handleDoorOpening1F() {
+            // YOLO가 문 열림을 확인할 때까지 대기함
+            if (door_state_ == "open") {
+                ROS_INFO("✅ Door opened! Waiting for robot boarding...");
+                changeState(WAITING_FOR_BOARDING);
+            }
+        }
+
+        void handleWaitingForBoarding() {
+            // 로봇 탑승 감지 시 자동으로 문 닫고 출발
+            if (robot_inside_) {
+                ROS_INFO("🛗 Robot boarded! Closing door...");
+                action_timer_.stop();
+                sendDoorCommand("close");
+                changeState(DOOR_CLOSING_1F);
+            }
+        }
+
+        void handleDoorClosing1F() {
+            // 문이 완전히 닫힌 후 2층으로 올라감
+            if (door_state_ == "close") {
+                ROS_INFO("🔺 Door closed! Moving to 2F...");
+                moveElevatorTo(1);
+                changeState(MOVING_TO_2F);
+            }
+        }
+
+        void handleMovingTo2F() {
+            // 2층 도착 확인
+            if (current_floor_ == 1 && !is_moving_) {
+                ROS_INFO("🔝 Arrived at 2F! Opening door...");
+                sendDoorCommand("open");
+                changeState(DOOR_OPENING_2F);
+            }
+        }
+
+        void handleDoorOpening2F() {
+            // 2층에서 문 열림 확인
+            if (door_state_ ==  "open") {
+                ROS_INFO("⬅️ Door opened at 2F! Waiting for robot exit...");
+                changeState(WAITING_FOR_EXIT);
+            }
+        }
+
+        void handleWaitingForExit() {
+            // 로봇 하차 감지 후 자동으로 문 "close"
+            if (!robot_inside_) {
+                ROS_INFO("🔄 Robot exited! Closing door...");
+                sendDoorCommand("close");
+                changeState(DOOR_CLOSING_2F);
+            }
+            // 타임아웃 체크 추가함 - 너무 오래 기다릴때는 문 닫기
+            else {
+                double wait_time = (ros::Time::now() - state_change_time_).toSec();
+                if (wait_time > boarding_timeout_) {
+                    ROS_WARN("⏰ Exit timeout! Closing door...");
+                    sendDoorCommand("close");
+                    changeState(DOOR_CLOSING_2F);
+                }
+            }
+        }
+
+        void handleDoorClosing2F() {
+            // 문이 완전히 닫힌 후 1층으로 복귀
+            if (door_state_ == "close") {
+                ROS_INFO("🔻 Door closed! Returning to 1F...");
+                moveElevatorTo(0);
+                changeState(RETURNING_TO_1F);
+            }
+        }
+
+        void handleReturningTo1F() {
+            // 1층 복귀 완료 확인
+            if (current_floor_ == 0 && !is_moving_) {
+                ROS_INFO("✅ Back to 1F! Mission completed!");
+                changeState(IDLE_AT_1F);
+                logMissionComplete();
+            }
+        }
+
+        void handleErrorState() {
+            ROS_ERROR("🚨 Error state! Attempting Recovery...");
+
+            // 간단한 복구 로직
+            if (current_floor_ == 0 ) {
+                changeState(IDLE_AT_1F);
+            } else {
+                moveElevatorTo(0);
+                changeState(RETURNING_TO_1F);
+            }
+        }
+
+        // 유틸리티 함수
+        void moveElevatorTo(int floor) {
+            std_msgs::Int32 floor_cmd;
+            floor_cmd.data = floor;
+            elevator_control_pub_.publish(floor_cmd);
+            
+            ROS_INFO("🛗 Elevator move command sent: Floor %d", floor);
+        }
+
+        void sendDoorCommand(const std::string& command) {
+            std_msgs::String door_cmd;
+            door_cmd.data = command;
+            door_control_pub_.publish(door_cmd);
+            
+            ROS_INFO("🚪 Door command sent: %s", command.c_str());
+        }
+
+        void changeState(State new_state) {
+            if (current_state_ != new_state) {
+                ROS_INFO("🔄 State change: %s → %s", 
+                    stateToString(current_state_).c_str(), 
+                    stateToString(new_state).c_str());
+                
+                current_state_ = new_state;
+                state_change_time_ = ros::Time::now();
+                
+                // 타임아웃 타이머 재시작
+                action_timer_.stop();
+                action_timer_ = nh_.createTimer(ros::Duration(action_timeout_), 
+                                            &GazeboElevatorController::timeoutCallback, this, true);
+            }
+        }
+
+        std::string stateToString(State state) {
+            switch (state) {
+                case IDLE_AT_1F: return "IDLE_AT_1F";
+                case DOOR_OPENING_1F: return "DOOR_OPENING_1F";
+                case WAITING_FOR_BOARDING: return "WAITING_FOR_BOARDING";
+                case DOOR_CLOSING_1F: return "DOOR_CLOSING_1F";
+                case MOVING_TO_2F: return "MOVING_TO_2F";
+                case DOOR_OPENING_2F: return "DOOR_OPENING_2F";
+                case WAITING_FOR_EXIT: return "WAITING_FOR_EXIT";
+                case DOOR_CLOSING_2F: return "DOOR_CLOSING_2F";
+                case RETURNING_TO_1F: return "RETURNING_TO_1F";
+                case ERROR_STATE: return "ERROR_STATE";
+                default: return "UNKNOWN";
+            }
+        }
+
+        // 🎯 타임아웃 및 에러 처리
+        void checkTimeout() {
+            double elapsed = (ros::Time::now() - state_change_time_).toSec();
+            if (elapsed > action_timeout_) {
+                ROS_WARN("⏰ State timeout! Current state: %s (%.1fs)", 
+                    stateToString(current_state_).c_str(), elapsed);
+                changeState(ERROR_STATE);
+            }
+        }
+
+        void timeoutCallback(const ros::TimerEvent&) {
+            ROS_WARN("⏰ Action timeout in state: %s", stateToString(current_state_).c_str());
+            changeState(ERROR_STATE);
+        }
+
+
+        // 🎯 통계 및 로깅
+        void logMissionComplete() {
+            mission_count_++;
+            double mission_time = (ros::Time::now() - mission_start_time_).toSec();
+            total_wait_time_ += mission_time;
+            
+            ROS_INFO("📊 Mission #%d completed in %.1f seconds", mission_count_, mission_time);
+            
+            // 다음 미션 준비
+            mission_start_time_ = ros::Time::now();
+        }
+
+        void printStatisticsCallback(const ros::TimerEvent&) {
+            double avg_time = (mission_count_ > 0) ? (total_wait_time_ / mission_count_) : 0.0;
+            
+            ROS_INFO("📈 Statistics: %d missions, avg time: %.1fs, state: %s", 
+                mission_count_, avg_time, stateToString(current_state_).c_str());
+        }
 };
 
-int main(int argc, char** argv)
-{
+int main(int argc, char** argv) {
     ros::init(argc, argv, "gazebo_elevator_controller");
     
-    try
-    {
-        GazeboElevatorController controller;
-        ros::spin();
-    }
-    catch (const std::exception& e)
-    {
-        ROS_ERROR("❌ Exception in elevator controller: %s", e.what());
-        return 1;
-    }
+    GazeboElevatorController controller;
+    
+    ROS_INFO("🛗 Gazebo Elevator Controller running...");
+    ROS_INFO("🎯 Compatible with both new actuator and legacy systems");
+    ros::spin();
     
     return 0;
 }

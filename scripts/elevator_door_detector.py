@@ -6,6 +6,7 @@
 import rospy
 from sensor_msgs.msg import Image
 from std_msgs.msg import Int32
+from std_msgs.msg import String
 from cv_bridge import CvBridge, CvBridgeError
 import cv2
 import sys
@@ -130,9 +131,13 @@ class ElevatorDoorDetector:
         door_status = self.extract_door_status(pred)
 
         if door_status is not None:
-            self.status_pub.publish(Int32(door_status))
-            status_name = self.names[door_status] if door_status < len(self.names) else f"class_{door_status}"
-            rospy.loginfo(f"🚪 Elevator door: {status_name} (class={door_status})")
+            # self.status_pub.publish(Int32(door_status))
+            # status_name = self.names[door_status] if door_status < len(self.names) else f"class_{door_status}"
+            # rospy.loginfo(f"🚪 Elevator door: {status_name} (class={door_status})")
+            # Int32 대신 String으로 발행
+            status_name = "close" if door_status == 0 else "open"
+            self.status_pub.publish(String(status_name))
+            rospy.loginfo(f"Elevator door: status_name")
         else:
             print("⚠️ No elevator door detected")
     

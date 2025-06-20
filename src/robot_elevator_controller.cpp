@@ -13,12 +13,14 @@ class RobotElevatorController {
         ros::Subscriber door_state_sub_; // YOLO 문 상태
         ros::Subscriber current_floor_sub_; // 현재 층
         ros::Subscriber robot_inside_sub_; // 로봇이 내부에 있는지 여부
+        ros::Subscriber door_status_sub_; // 문 상태
 
         // publisher (토픽 보내는 애)
         ros::Publisher cmd_vel_pub_; // 로봇 제어 명령 발행
 
         // member variables
-        std::string door_state_; 
+        std::string door_state_;  // YOLO에서 받아올 문상태
+        std::string door_status_;  // 문 상태 (open, close, moving)
         int current_floor_; 
         bool robot_inside_;
         bool is_moving_;
@@ -32,53 +34,65 @@ class RobotElevatorController {
     public:
         RobotElevatorController() {
             door_state_ = "close";
+            door_status_ = "close";
             current_floor_ = 0;
             robot_inside_ = false;
             is_moving_ = false;
             last_action_time_ = ros::Time::now();
 
-            // 토픽 구독 설정
-            door_state_sub_ = nh_.subscribe(
-                "/elevator_door_state",
-                1, // 큐 크기
-                &RobotElevatorController::doorCallback,
-                this
-            );
-
-            current_floor_sub_ = nh_.subscribe(
-                "/elevator_sim/current_floor",
-                1,
-                &RobotElevatorController::floorCallback,
-                this
-            );
-
-            robot_inside_sub_ = nh_.subscribe(
-                "/elevator_sim/robot_inside",
-                1,
-                &RobotElevatorController::insideCallback,
-                this
-            );
-
-            // 토픽 발행 설정
-            cmd_vel_pub_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1);
+            initializeSubscribers();
+            initializePublishers();
 
             ROS_INFO("🤖 Robot Elevator Controller started!");
-            ROS_INFO("🔍️ YOLO detects: 'open' (fully open) / 'close' (fully close)");
+            ROS_INFO("🔍️ Compatible with both YOLO and new feedback systems");
         }
 
-        void doorCallback(const std_msgs::String::ConstPtr& msg) {
+    private:
+        void initializeSubscribers() {
+            // 기존 YOLO 시스템
+            door_state_sub_ = nh_.subscribe("/elevator_vision/door_status", 1, &RobotElevatorController::doorVisionCallback, this);
+
+            // 새로운 피드백 시스템 
+            current_floor_sub_ = nh_.subscribe("/elevator/current_floor", 1, &RobotElevatorController::floorCallback, this);
+            robot_inside_sub_ = nh_.subscribe("/elevator/robot_inside", 1, 
+                                        &RobotElevatorController::insideCallback, this);
+            door_status_sub_ = nh_.subscribe("/elevator/door_status", 1, 
+                                        &RobotElevatorController::doorStatusCallback, this);
+
+            ROS_INFO("📡 Subscribers initialized");
+        }
+
+        void initializePublishers() {
+            cmd_vel_pub_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1);
+            ROS_INFO("📡 Publishers initialized");
+        }
+
+        // 콜백 함수들
+        void doorVisionCallback(const std_msgs::String::ConstPtr& msg) {
             std::string prev_door_state = door_state_;
             door_state_ = msg->data; // msg의 data 필드 접근
             
             // 문 상태 변화 시에만 로그 출력
             if (prev_door_state != door_state_) {
                 ROS_INFO("Door state: %s", door_state_.c_str());
+
+                if (door_state_ == "open" && !is_moving_) {
+                    decideAction();
+                }
             }
 
-            if (door_state_ == "open" && !is_moving_) {
-                decideAction();
-            } else if (door_state_ == "open" && is_moving_) {
-                ROS_INFO("Door opened but robot is moving - ignore!");
+        }
+
+        void doorStatusCallback(const std_msgs::String::ConstPtr& msg) {
+            std::string prev_door_status = door_status_;
+            door_status_ = msg->data;
+
+            if (prev_door_status != door_status_) {
+                ROS_INFO("🚪 Door Status: %s", door_status_.c_str());
+
+                if (door_status_ == "open" && !is_moving_) {
+                    decideAction();
+                }
             }
         }
 
@@ -101,7 +115,7 @@ class RobotElevatorController {
                 ROS_INFO("📍 Robot: %s", robot_inside_ ? "INSIDE" : "OUTSIDE");
                 
                 // 로봇 위치가 바뀌었고 문이 열려있고 이동중이 아니면 조건 체크
-                if (door_state_ == "open" && !is_moving_) {
+                if (isDoorOpen() && !is_moving_) {
                     ROS_INFO("🔄 Robot position changed while door open - rechecking conditions");
                     decideAction();
                 }
@@ -110,6 +124,10 @@ class RobotElevatorController {
 
 
         // 사용자 정의 함수들
+        bool isDoorOpen() {
+            // 두 시스템 중 하나라도 문이 열렸다고 하면 열린 것으로 판단함
+            return (door_state_ == "open" || door_status_ == "close");
+        }
 
         // 액션 결정
         void decideAction() {
@@ -139,9 +157,15 @@ class RobotElevatorController {
         // 기본 안전 조건 정의
         bool isBasicSafetyOK() {
             // 너무 자주 액션하지 않게함
-            double time_since_last = (ros::Time::now() = last_action_time_).toSec();
+            double time_since_last = (ros::Time::now() - last_action_time_).toSec();
             if (time_since_last < 2.0) {
                 ROS_INFO("⚠️ Too soon after last action ($.1fs ago)", time_since_last);
+                return false;
+            }
+
+            // 이미 이동중이라면 안전하지 않음!
+            if (is_moving_) {
+                ROS_INFO("⚠️ Robot is currently moving");
                 return false;
             }
 
@@ -152,7 +176,7 @@ class RobotElevatorController {
         bool shouldEnterElevator() {
             bool floor_ok = (current_floor_ == 0); // 1층
             bool position_ok = (!robot_inside_); // 밖
-            bool door_ok = (door_state_ == "open"); // 문 활짝 열림
+            bool door_ok = isDoorOpen(); // 문 활짝 열림
             bool moving_ok = (!is_moving_); // 이동중 아님
 
             ROS_INFO("🔍 Enter check: Floor(1F):%s, Outside:%s, DoorOpen:%s, NotMoving:%s",
@@ -168,7 +192,7 @@ class RobotElevatorController {
         bool shouldExitElevator() {
             bool floor_ok = (current_floor_ == 1); // 2층
             bool position_ok = (robot_inside_); // 안
-            bool door_ok = (door_state_ == "open");
+            bool door_ok = isDoorOpen();
             bool moving_ok = (!is_moving_); 
 
             ROS_INFO("🔍 Exit check: Floor(2F):%s, Inside:%s, DoorOpen:%s, NotMoving:%s",
@@ -177,7 +201,7 @@ class RobotElevatorController {
                 door_ok ? "✅" : "❌",
                 moving_ok ? "✅" : "❌");
         
-        return floor_ok && position_ok && door_ok && moving_ok;
+            return floor_ok && position_ok && door_ok && moving_ok;
         }
 
         void explainCurrentSituation() {
@@ -259,6 +283,7 @@ class RobotElevatorController {
 
         void printCurrentConditions() {
             ROS_INFO("📊 Current state:");
+            ROS_INFO("   🎥 YOLO Door: %s", door_state_.c_str());
             ROS_INFO("   🚪 Door: %s", door_state_.c_str());
             ROS_INFO("   🏢 Floor: %d (%s)", current_floor_, current_floor_ == 0 ? "1층" : "2층");
             ROS_INFO("   📍 Robot: %s", robot_inside_ ? "INSIDE" : "OUTSIDE");
@@ -267,14 +292,16 @@ class RobotElevatorController {
 
         // 디버깅/테스트용 함수들
         void printStatus() {
-            ROS_INFO("🔄 Status - Door: %s, Floor: %d, Inside: %s, Moving: %s",
+            ROS_INFO("🔄 Status - YOLO: %s, System: %s, Floor: %d, Inside: %s, Moving: %s",
                     door_state_.c_str(), 
+                    door_status_.c_str(),
                     current_floor_,
                     robot_inside_ ? "YES" : "NO",
                     is_moving_ ? "YES" : "NO"
             );
         }
 
+    public:
         // 수동 테스트용
         void manualEnter() {
             ROS_INFO("🧪 Manual test: Enter");
@@ -288,6 +315,10 @@ class RobotElevatorController {
             if (isBasicSafetyOK()) {
                 exitElevator();
             }
+        }
+
+        void debugPrint() {
+            printStatus();
         }
 };
 
@@ -305,7 +336,7 @@ int main(int argc, char** argv) {
     // 15초마다 상태 출력
     ros::Timer status_timer = controller.nh_.createTimer(ros::Duration(15.0), 
         [&controller](const ros::TimerEvent&) {
-            controller.printStatus();
+            controller.debugPrint();
         });
     
     ros::spin();
